@@ -1,0 +1,155 @@
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const pool = require('../config/pg');
+require('dotenv').config();
+
+class AuthService {
+    constructor() {
+        this.JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
+        this.REFRESH_SECRET = process.env.REFRESH_SECRET || 'refreshsecretkey';
+    }
+
+    // Helper function: Get user by identifier (email, username, or phone number)
+    static async getUserByIdentifier(userIdentifier) {
+        try {
+            let userQuery = 'SELECT * FROM users WHERE email = $1 OR username = $1';
+            let params = [userIdentifier];
+
+            if (!userIdentifier.includes('@') && !userIdentifier.match(/^[a-zA-Z0-9]+$/)) {
+                userQuery = 'SELECT * FROM users WHERE phone_number = $1';
+                params = [userIdentifier];
+
+                const phoneUsers = await pool.query(userQuery, params);
+                if (phoneUsers.rows.length > 1) {
+                    throw new Error('Multiple accounts found with this phone number. Use email or username.');
+                } else if (phoneUsers.rows.length === 0) {
+                    throw new Error('User not found');
+                }
+                return phoneUsers.rows[0];
+            } else {
+                const result = await pool.query(userQuery, params);
+                if (result.rows.length === 0) throw new Error('User not found');
+                return result.rows[0];
+            }
+        } catch (err) {
+            throw new Error(err.message);
+        }
+    }
+
+    // Validate password strength
+    static validatePassword(password) {
+        const regex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d!@#$%^&*()_+]{8,}$/;
+        if (!regex.test(password)) {
+            throw new Error('Password must be at least 8 characters long and contain both letters and numbers.');
+        }
+    }
+
+    // Validate username format
+    static validateUsername(username) {
+        const regex = /^[a-zA-Z0-9_]{3,20}$/;
+        if (!regex.test(username)) {
+            throw new Error('Username must be 3-20 characters long and contain only letters, numbers, or underscores.');
+        }
+    }
+
+    validatePhoneNumber(phoneNumber) {
+        const phoneRegex = /^\d{10,15}$/;
+        if (!phoneRegex.test(phoneNumber)) {
+          throw new Error('Invalid phone number format');
+        }
+      }
+
+    // Register User
+    async registerUser(username, password, email, phoneNumber, role = 'user') {
+        try {
+            this.validatePassword(password);
+            this.validateUsername(username);
+            this.validatePhoneNumber(phoneNumber);
+
+            const emailCheck = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+            if (emailCheck.rows.length > 0) throw new Error('Email already in use');
+
+            const usernameCheck = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+            if (usernameCheck.rows.length > 0) throw new Error('Username already in use');
+
+            const hashedPassword = await bcrypt.hash(password, 10);
+
+            const result = await pool.query(
+                'INSERT INTO users (username, password, email, phone_number, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, username, email, phone_number, role',
+                [username, hashedPassword, email, phoneNumber, role]
+            );
+
+            return result.rows[0];
+        } catch (err) {
+            throw new Error(err.message);
+        }
+    }
+
+    // Login User
+    async loginUser(userIdentifier, password) {
+        try {
+            const user = await this.getUserByIdentifier(userIdentifier);
+            const passwordMatch = await bcrypt.compare(password, user.password);
+            if (!passwordMatch) throw new Error('Invalid password');
+
+            return this.generateTokens(user.id, user.role);
+        } catch (err) {
+            throw new Error(err.message);
+        }
+    }
+
+    // Generate JWT and Refresh Token
+    static generateTokens(userId, role) {
+        const token = jwt.sign({ id: userId, role }, this.JWT_SECRET, { expiresIn: '1h' });
+        const refreshToken = jwt.sign({ id: userId }, this.REFRESH_SECRET, { expiresIn: '7d' });
+
+        return { token, refreshToken };
+    }
+
+    // Forgot Password (Send Reset Token)
+    async forgotPassword(userIdentifier) {
+        try {
+            const user = await this.getUserByIdentifier(userIdentifier);
+            const resetToken = jwt.sign({ id: user.id }, this.JWT_SECRET, { expiresIn: '15m' });
+
+            // Here, you would normally send an email with the resetToken
+            return { message: 'Password reset link sent', resetToken };
+        } catch (err) {
+            throw new Error(err.message);
+        }
+    }
+
+    // Resend Verification Token (For email verification)
+    async resendVerificationToken(userIdentifier) {
+        try {
+            const user = await this.getUserByIdentifier(userIdentifier);
+            const verificationToken = jwt.sign({ id: user.id }, this.JWT_SECRET, { expiresIn: '1h' });
+
+            // Here, you would normally send an email with the verificationToken
+            return { message: 'Verification token sent', verificationToken };
+        } catch (err) {
+            throw new Error(err.message);
+        }
+    }
+
+    // Refresh Token Flow
+    async refreshAccessToken(refreshToken) {
+        try {
+            const decoded = jwt.verify(refreshToken, this.REFRESH_SECRET);
+            return this.generateTokens(decoded.id, decoded.role);
+        } catch (err) {
+            throw new Error('Invalid refresh token');
+        }
+    }
+
+    // Verify JWT Token
+    verifyToken(token) {
+        try {
+            return jwt.verify(token, this.JWT_SECRET);
+        } catch (err) {
+            return null;
+        }
+    }
+}
+
+module.exports = new AuthService();
